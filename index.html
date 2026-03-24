@@ -223,10 +223,6 @@
               webSocket.send(event.data);
             }
           };
-          micNode.port.postMessage({
-            type: "config",
-            sampleRate: SAMPLE_RATE,
-          });
           micSourceNode =
             audioContext.createMediaStreamSource(audioMediaStream);
           micSourceNode.connect(micNode);

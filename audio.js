@@ -1,22 +1,11 @@
 class EncoderProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.sampleRate = 0;
-    this.port.onmessage = (event) => {
-      const message = event.data;
-      switch (message.type) {
-        case "config":
-          this.sampleRate = message.sampleRate;
-          break;
-      }
-    };
-  }
-
   process(inputs, outputs, parameters) {
-    const inputChannels = inputs[0];
-    if (inputChannels && inputChannels.length > 0) {
-      const audioFrame = new Float32Array(inputChannels[0]);
-      this.port.postMessage(audioFrame);
+    if (inputs.length > 0) {
+      const inputChannels = inputs[0];
+      if (inputChannels && inputChannels.length > 0) {
+        const audioFrame = new Float32Array(inputChannels[0]);
+        this.port.postMessage(audioFrame, { transfer: [audioFrame.buffer] });
+      }
     }
     return true;
   }
@@ -25,93 +14,38 @@ class EncoderProcessor extends AudioWorkletProcessor {
 registerProcessor("encoder-processor", EncoderProcessor);
 
 class DecoderProcessor extends AudioWorkletProcessor {
+  #ring;
+
   constructor() {
     super();
-    this.sampleRate = 0;
-    this.sampleWindow = 0;
-    this.buffer;
-    this.write = 0;
-    this.drain = 0;
-    this.available = 0;
     this.port.onmessage = (event) => {
       const message = event.data;
       switch (message.type) {
         case "config":
-          this.sampleRate = message.sampleRate;
-          this.sampleWindow = message.sampleWindow;
-          this.buffer = new Float32Array(this.sampleRate * this.sampleWindow);
-          this.write = 0;
-          this.drain = 0;
-          this.available = 0;
+          this.#ring = new Ring(message.sampleRate * message.sampleWindow);
           break;
         case "data":
-          this.enqueue(message.data);
+          if (this.#ring) {
+            this.#ring.enqueue(message.data);
+          }
           break;
       }
     };
   }
 
-  enqueue(input) {
-    if (!this.buffer) {
-      return;
-    }
-    const len = input.length;
-    if (len === 0) return;
-    if (this.available + len > this.buffer.length) {
-      // On overflow, drop the oldest samples to make room.
-      const excess = this.available + len - this.buffer.length;
-      const overflow = this.drain + excess;
-      this.drain = overflow % this.buffer.length;
-      this.available -= excess;
-    }
-    const lenToTheEnd = Math.min(len, this.buffer.length - this.write);
-    this.buffer.set(input.subarray(0, lenToTheEnd), this.write);
-    if (lenToTheEnd < len) {
-      // Wrap around...
-      this.buffer.set(input.subarray(lenToTheEnd), 0);
-    }
-    const overflow = this.write + len;
-    this.write = overflow % this.buffer.length;
-    this.available += len;
-  }
-
-  dequeue(output) {
-    if (!this.buffer) {
-      output.fill(0);
-      return;
-    }
-    const len = output.length;
-    const readable = Math.min(len, this.available);
-    const readableUntilTheEnd = Math.min(
-      readable,
-      this.buffer.length - this.drain,
-    );
-    output.set(
-      this.buffer.subarray(this.drain, this.drain + readableUntilTheEnd),
-      0,
-    );
-    if (readableUntilTheEnd < readable) {
-      // Wrap around...
-      output.set(
-        this.buffer.subarray(0, readable - readableUntilTheEnd),
-        readableUntilTheEnd,
-      );
-    }
-    const overflow = this.drain + readable;
-    this.drain = overflow % this.buffer.length;
-    this.available -= readable;
-    if (readable < len) {
-      output.fill(0, readable);
-    }
-  }
-
   process(inputs, outputs, parameters) {
-    const outputChannels = outputs[0];
-    if (outputChannels && outputChannels.length > 0) {
-      const monoChannel = outputChannels[0];
-      this.dequeue(monoChannel);
-      for (let i = 1; i < outputChannels.length; i++) {
-        outputChannels[i].set(monoChannel);
+    if (outputs.length > 0) {
+      const outputChannels = outputs[0];
+      if (outputChannels && outputChannels.length > 0) {
+        const monoChannel = outputChannels[0];
+        if (this.#ring) {
+          this.#ring.dequeue(monoChannel);
+        } else {
+          monoChannel.fill(0);
+        }
+        for (let i = 1; i < outputChannels.length; i++) {
+          outputChannels[i].set(monoChannel);
+        }
       }
     }
     return true;
@@ -119,3 +53,54 @@ class DecoderProcessor extends AudioWorkletProcessor {
 }
 
 registerProcessor("decoder-processor", DecoderProcessor);
+
+class Ring {
+  buffer;
+  write = 0;
+  drain = 0;
+  available = 0;
+
+  constructor(capacity) {
+    this.buffer = new Float32Array(capacity);
+  }
+
+  enqueue(input) {
+    const capacity = this.buffer.length;
+    if (input.length > capacity) {
+      // Cut to capacity.
+      input = input.subarray(input.length - capacity);
+    }
+    const len = input.length;
+    const lenToEnd = Math.min(len, capacity - this.write);
+    this.buffer.set(input.subarray(0, lenToEnd), this.write);
+    if (lenToEnd < len) {
+      this.buffer.set(input.subarray(lenToEnd), 0);
+    }
+    this.available += len;
+    this.write = (this.write + len) % capacity;
+    if (this.available > capacity) {
+      // The drain index can't be behind the write index.
+      this.available = capacity;
+      this.drain = this.write;
+    }
+  }
+
+  dequeue(output) {
+    const capacity = this.buffer.length;
+    const len = output.length;
+    const readable = Math.min(len, this.available);
+    const readableToEnd = Math.min(readable, capacity - this.drain);
+    output.set(this.buffer.subarray(this.drain, this.drain + readableToEnd), 0);
+    if (readableToEnd < readable) {
+      output.set(
+        this.buffer.subarray(0, readable - readableToEnd),
+        readableToEnd,
+      );
+    }
+    this.drain = (this.drain + readable) % this.buffer.length;
+    this.available -= readable;
+    if (readable < len) {
+      output.fill(0, readable);
+    }
+  }
+}
