@@ -4,11 +4,23 @@ class EncoderProcessor extends AudioWorkletProcessor {
       const inputChannels = inputs[0];
       if (inputChannels && inputChannels.length > 0) {
         const audioFrame = new Float32Array(inputChannels[0]);
-        this.port.postMessage(audioFrame, { transfer: [audioFrame.buffer] });
+        if (!isZero(audioFrame)) {
+          this.port.postMessage(audioFrame, { transfer: [audioFrame.buffer] });
+        }
       }
     }
     return true;
   }
+}
+
+function isZero(array) {
+  for (let index = 0; index < array.length; index++) {
+    const element = array[index];
+    if (element !== 0.0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 registerProcessor("encoder-processor", EncoderProcessor);
