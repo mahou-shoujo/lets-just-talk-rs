@@ -1,232 +1,222 @@
-use axum::{
-    Router,
-    body::Body,
-    extract::{
-        Path, WebSocketUpgrade,
-        ws::{Message, WebSocket},
-    },
-    http::{HeaderName, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{any, get},
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
 };
-use axum_server::tls_rustls::RustlsConfig;
-use futures_util::{SinkExt, StreamExt, future::BoxFuture, stream};
 use log::{info, warn};
 use std::{
-    collections::HashMap, env, error::Error, net::SocketAddr, path::PathBuf, sync::Arc,
+    error::Error,
+    net::{IpAddr, SocketAddr},
+    panic,
     time::Duration,
 };
 use tokio::{
-    fs::read,
-    io::Error as IoError,
-    runtime::Runtime,
+    net::{TcpListener, TcpStream},
     select,
     sync::{
-        RwLock,
-        mpsc::{Sender, channel},
-        oneshot,
+        broadcast::{self, Sender as BroadcastSender, error::RecvError as BroadcastRecvError},
+        oneshot::{self, Receiver as OneshotReceiver, Sender as OneshotSender},
     },
+    task::{JoinError, JoinSet},
     time::sleep,
 };
-use uuid::Uuid;
+use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
-const WAIT_BOUNCE: Duration = Duration::from_secs(1);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-const WAIT_AUTOREMOVE: Duration = Duration::from_secs(15);
+const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
-struct State {
-    rooms: HashMap<String, Vec<Client>>,
-}
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-struct Client {
-    id: Uuid,
-    tx: Option<Sender<Message>>,
-}
+const CAPACITY: usize = 32768;
 
-pub fn main() -> Result<(), Box<dyn Error>> {
+const PORT: u16 = 3000;
+
+#[tokio::main]
+pub async fn main() -> Result<(), Box<dyn Error>> {
     simple_logger::init_with_env()?;
-    let rt = Arc::new(Runtime::new()?);
-    let state = Arc::new(RwLock::new(State {
-        rooms: HashMap::new(),
-    }));
-    let (tx, rx) = oneshot::channel();
+    let (abort_tx, abort_rx) = oneshot::channel();
+    let (broadcast_tx, _) = broadcast::channel(CAPACITY);
+    set_shutdown_hook(abort_tx, broadcast_tx.clone());
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), PORT)).await?;
+    info!("listening on {PORT}");
+    let mut join_set = JoinSet::new();
+    serve(abort_rx, broadcast_tx, &listener, &mut join_set).await;
+    shutdown(&mut join_set).await;
+    Ok(())
+}
+
+fn set_shutdown_hook(abort_tx: OneshotSender<()>, broadcast_tx: BroadcastSender<Broadcast>) {
     let _ = ctrlc::set_handler({
-        let rt = rt.clone();
-        let state = state.clone();
-        let mut tx = Some(tx);
+        let mut once = Some((abort_tx, broadcast_tx));
         move || {
-            if let Some(tx) = tx.take() {
-                let state = state.clone();
-                rt.spawn(async move {
-                    {
-                        let mut state = state.write().await;
-                        for clients in state.rooms.values_mut() {
-                            for client in clients {
-                                if let Some(tx) = client.tx.take() {
-                                    let _ = tx.try_send(Message::Close(None));
-                                }
-                                info!("Sending close to client {}", client.id);
-                            }
-                        }
-                    }
-                    sleep(WAIT_BOUNCE).await;
-                    let _ = tx.send(());
+            if let Some((abort_tx, broadcast_tx)) = once.take() {
+                let _ = broadcast_tx.send(Broadcast {
+                    addr: None,
+                    message: Message::Close(None),
                 });
+                let _ = abort_tx.send(());
             }
         }
     });
-    rt.block_on(async move {
-        let future = serve(state).await?;
-        tokio::select! {
-            _ = rx => {}
-            result = future => {
-                result?;
-            },
-        }
-        Ok(())
-    })
 }
 
 async fn serve(
-    state: Arc<RwLock<State>>,
-) -> Result<BoxFuture<'static, Result<(), IoError>>, Box<dyn Error>> {
-    let cert = env::var("CERT");
-    let cert_key = env::var("CERT_KEY");
-    let use_tls = cert.is_ok() || cert_key.is_ok();
-    let app = Router::new()
-        .route("/resource/{resource}", get(resource_handler))
-        .route("/chat/{room}", get(root_handler))
-        .route(
-            "/chat/{room}/websocket",
-            any(move |Path(room): Path<String>, ws| websocket_handler(room, ws, state)),
-        );
-    let port = if use_tls { 443 } else { 3000 };
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    Ok(if use_tls {
-        let config =
-            RustlsConfig::from_pem_file(PathBuf::from(cert?), PathBuf::from(cert_key?)).await?;
-        Box::pin(axum_server::bind_rustls(addr, config).serve(app.into_make_service()))
-    } else {
-        Box::pin(axum_server::bind(addr).serve(app.into_make_service()))
-    })
-}
-
-async fn resource_handler(Path(resource): Path<String>) -> Response {
-    file(resource)
-}
-
-async fn root_handler(Path(_): Path<String>) -> Response {
-    file("index.html".to_owned())
-}
-
-async fn websocket_handler(
-    room: String,
-    ws: WebSocketUpgrade,
-    state: Arc<RwLock<State>>,
-) -> Response {
-    ws.on_upgrade(move |socket| websocket_handle(room, socket, state))
-}
-
-async fn websocket_handle(room: String, websocket: WebSocket, state: Arc<RwLock<State>>) {
-    let id = Uuid::new_v4();
-    let (mut ws_tx, mut ws_rx) = websocket.split();
-    let (tx, mut rx) = channel(1024);
-    {
-        let mut state = state.write().await;
-        state
-            .rooms
-            .entry(room.clone())
-            .or_insert_with_key(|room| {
-                info!("Added a new room: {room}");
-                Vec::new()
-            })
-            .push(Client { id, tx: Some(tx) });
-    }
-    info!("Added a new client: {id}");
-    tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            if let Err(error) = ws_tx.send(message).await {
-                warn!("Unable to broadcast to {id}: {error}");
-            }
-        }
-        info!("Shut down broadcast to {id}");
-    });
-    let mut must_close = false;
+    mut abort_rx: OneshotReceiver<()>,
+    broadcast_tx: BroadcastSender<Broadcast>,
+    listener: &TcpListener,
+    join_set: &mut JoinSet<()>,
+) {
     loop {
-        select! {
-            next = ws_rx.next() => {
-                let Some(result) = next else {
-                    break;
-                };
-                match result {
-                    Ok(message) if matches!(&message, Message::Close(_)) => {}
-                    Ok(message) => {
-                        let state = state.read().await;
-                        for client in state.rooms.get(&room).into_iter().flatten() {
-                            if (client.id != id || room == "echo")
-                                && let Some(tx) = &client.tx
-                            {
-                                let _ = tx.try_send(message.clone());
-                            }
-                        }
+        tokio::select! {
+            _ = &mut abort_rx => {
+                break;
+            }
+            accept_result = listener.accept() => {
+                while let Some(join_result) = join_set.try_join_next() {
+                    rejoin(join_result);
+                }
+                match accept_result {
+                    Ok((tcp_stream, addr)) => {
+                        join_set.spawn(accept(broadcast_tx.clone(), addr, tcp_stream));
                     }
                     Err(error) => {
-                        warn!("Unable to read from {id}: {error}");
+                        warn!("accept error: {error}");
+                    }
+                }
+            },
+        }
+    }
+}
+
+async fn shutdown(join_set: &mut JoinSet<()>) {
+    if !join_set.is_empty() {
+        info!("waiting for {} tasks before shutdown", join_set.len());
+    }
+    while let Some(join_result) = join_set.join_next().await {
+        rejoin(join_result);
+    }
+}
+
+fn rejoin(result: Result<(), JoinError>) {
+    if let Err(error) = result
+        && let Ok(panic) = error.try_into_panic()
+    {
+        panic::resume_unwind(panic);
+    }
+}
+
+async fn accept(broadcast_tx: BroadcastSender<Broadcast>, addr: SocketAddr, tcp_stream: TcpStream) {
+    info!("new connection: {addr}");
+    if let Some(ws_stream) = handshake(addr, tcp_stream).await {
+        listen(broadcast_tx, addr, ws_stream).await;
+    }
+}
+
+async fn handshake(addr: SocketAddr, tcp_stream: TcpStream) -> Option<WebSocketStream<TcpStream>> {
+    select! {
+        ws_result = tokio_tungstenite::accept_async(tcp_stream) => {
+             match ws_result {
+                Ok(ws_stream) => Some(ws_stream),
+                Err(error) => {
+                    warn!("handshake error with {addr}: {error}");
+                    None
+                }
+            }
+        },
+        _ = sleep(HANDSHAKE_TIMEOUT) => {
+            warn!("handshake timeout with {addr}");
+            None
+        }
+    }
+}
+
+async fn listen(
+    broadcast_tx: BroadcastSender<Broadcast>,
+    addr: SocketAddr,
+    ws_stream: WebSocketStream<TcpStream>,
+) {
+    let mut broadcast_rx = broadcast_tx.subscribe();
+    let (mut ws_sink, mut ws_source) = ws_stream.split();
+    loop {
+        select! {
+            maybe_message = recv(addr, &mut ws_source) => {
+                match maybe_message {
+                    Some(message) if matches!(&message, Message::Close(_)) => {}
+                    Some(message) => {
+                        if broadcast_tx.send(Broadcast { addr: Some(addr), message }).is_err() {
+                            warn!("broadcast overload");
+                        }
+                    }
+                    None => {
+                        break;
                     }
                 }
             }
-            _ = sleep(WAIT_AUTOREMOVE) => {
-                must_close = true;
-                break;
+            broadcast_result = broadcast_rx.recv() => {
+                match broadcast_result {
+                    Ok(broadcast) => {
+                        if broadcast.addr.is_none_or(|broadcast_addr| broadcast_addr != addr) {
+                            send(broadcast.message, addr, &mut ws_sink).await;
+                        }
+                    }
+                    Err(BroadcastRecvError::Lagged(_)) => {},
+                    Err(BroadcastRecvError::Closed) => {
+                        break;
+                    }
+                }
             }
         }
-    }
-
-    let mut state = state.write().await;
-    let tx = if let Some(mut clients) = state.rooms.remove(&room) {
-        let mut found = false;
-        let mut found_what = None;
-        clients.retain_mut(|client| {
-            let matches = client.id == id;
-            found |= matches;
-            if matches && let Some(tx) = client.tx.take() {
-                found_what = Some(tx);
-            }
-            !matches
-        });
-        if found {
-            info!("Dropped client {id}");
-        } else {
-            warn!("Dropped nonexistent client {id}");
-        }
-        if !clients.is_empty() {
-            state.rooms.insert(room, clients);
-        } else {
-            info!("Dropped room {room}");
-        }
-        found_what
-    } else {
-        None
-    };
-    if must_close && let Some(tx) = tx {
-        let _ = tx.try_send(Message::Close(None));
-        sleep(WAIT_BOUNCE).await;
     }
 }
 
-fn file(resource: String) -> Response {
-    let mime = match resource.as_str() {
-        "index.html" => Some("text/html"),
-        "audio.js" => Some("application/javascript"),
-        _ => None,
-    };
-    match mime {
-        Some(mime) => Response::builder()
-            .header(HeaderName::from_static("content-type"), mime)
-            .body(Body::from_stream(stream::once(async move {
-                read(resource).await
-            })))
-            .expect("invalid response"),
-        None => StatusCode::NOT_FOUND.into_response(),
+async fn recv(
+    addr: SocketAddr,
+    source: &mut SplitStream<WebSocketStream<TcpStream>>,
+) -> Option<Message> {
+    loop {
+        select! {
+            maybe_message_result = source.next() => {
+                let Some(message_result) = maybe_message_result else {
+                    info!("closed {addr}");
+                    break None;
+                };
+                match message_result {
+                    Ok(message) if matches!(&message, Message::Close(_)) => {}
+                    Ok(message) => {
+                        break Some(message);
+                    }
+                    Err(error) => {
+                        warn!("recv error with {addr}: {error}");
+                    }
+                }
+            }
+            _ = sleep(IDLE_TIMEOUT) => {
+                warn!("idle timeout with {addr}");
+                break None;
+            }
+        }
     }
+}
+
+async fn send(
+    message: Message,
+    addr: SocketAddr,
+    ws_sink: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
+) {
+    select! {
+        send_result = ws_sink.send(message) => {
+            if let Err(error) = send_result {
+                warn!("send error with {addr}: {error}");
+            }
+        },
+        _ = sleep(SEND_TIMEOUT) => {
+            warn!("send timeout with {addr}");
+        }
+    };
+}
+
+#[derive(Debug, Clone)]
+struct Broadcast {
+    addr: Option<SocketAddr>,
+    message: Message,
 }

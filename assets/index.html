@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>Let's Just Talk</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+      }
+
+      html {
+        background: black;
+        color: whitesmoke;
+      }
+
+      body {
+        height: 100vh;
+
+        display: flex;
+        flex-direction: column;
+      }
+
+      #loader {
+        position: absolute;
+        top: 2ch;
+        right: 2ch;
+
+        margin: auto;
+
+        width: 4ch;
+        height: 4ch;
+
+        animation: rotation 1s linear infinite;
+        border: 0.5ch solid #fff;
+        border-bottom-color: transparent;
+        border-radius: 50%;
+        box-sizing: border-box;
+        display: inline-block;
+        transition: opacity 1000ms;
+      }
+
+      @keyframes rotation {
+        0% {
+          transform: rotate(0deg);
+        }
+        100% {
+          transform: rotate(360deg);
+        }
+      }
+
+      .error {
+        display: flex;
+        flex-direction: column;
+        gap: 2ch;
+        padding: 2ch;
+      }
+
+      #participants {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(40ch, 1fr));
+        flex: 1;
+        gap: 1ch;
+        padding: 1ch;
+      }
+
+      .participant {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        border-radius: 1ch;
+        gap: 2ch;
+        padding: 1ch;
+      }
+
+      .participant-name {
+        width: 40ch;
+        border-radius: 1ch;
+        color: black;
+        overflow: clip;
+        text-align: center;
+        text-overflow: ellipsis;
+      }
+
+      .participant-name:disabled {
+        background: none;
+        border: none;
+        color: whitesmoke;
+      }
+
+      .participant-control {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 1ch;
+      }
+
+      .participant-control button {
+        border: none;
+        width: 3ch;
+        height: 3ch;
+        mask-size: 100%;
+      }
+
+      .mic-fill {
+        mask: url(images/mic-fill.svg) no-repeat center;
+      }
+
+      .mic-mute-fill {
+        mask: url(images/mic-mute-fill.svg) no-repeat center;
+      }
+
+      .mic-echo-cancellation {
+        mask: url(images/mic-echo-cancellation.svg) no-repeat center;
+      }
+
+      .mic-echo-cancellation.off {
+        opacity: 50%;
+      }
+
+      .mic-noise-suppression {
+        mask: url(images/mic-noise-suppression.svg) no-repeat center;
+      }
+
+      .mic-noise-suppression.off {
+        opacity: 50%;
+      }
+
+      .output-device {
+        mask: url(images/output-device.svg) no-repeat center;
+      }
+
+      .opaque {
+        opacity: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <template id="templateError">
+      <div class="error">
+        <h1>Unhandled Exception</h1>
+        <h3></h3>
+        <pre></pre>
+      </div>
+    </template>
+    <template id="templateParticipant">
+      <div class="participant">
+        <input
+          type="text"
+          class="participant-name"
+          oninput="onNameInput(event)"
+        />
+        <div class="participant-control">
+          <button
+            class="mic-switch mic-fill"
+            title="Microphone"
+            onclick="onMicSwitch(event)"
+          ></button>
+          <button
+            class="mic-echo-cancellation"
+            title="Echo cancellation"
+            onclick="onMicEchoCancellation(event)"
+          ></button>
+          <button
+            class="mic-noise-suppression"
+            title="Noise suppression"
+            onclick="onMicNoiseSuppression(event)"
+          ></button>
+          <button
+            class="output-device"
+            title="Select output device"
+            onclick="onSelectOutputDevice(event)"
+          ></button>
+        </div>
+      </div>
+    </template>
+    <div id="participants"></div>
+    <span id="loader"></span>
+    <audio id="sink"></audio>
+    <script>
+      const NETWORK_PULSE = 500;
+      const NETWORK_LIFETIME = 2500;
+      const NETWORK_ID = crypto.randomUUID();
+      const NETWORK_PARTICIPANT = { id: NETWORK_ID, name: "Unknown Guest" };
+
+      const COLORS = ["crimson", "green", "blue", "orange", "purple"];
+
+      const SAMPLE_RATE = 48000;
+      const SAMPLE_WINDOW = 3;
+
+      const CAN_SELECT_OUTPUT_DEVICE =
+        navigator.mediaDevices.selectAudioOutput !== undefined;
+
+      const templateError = document.querySelector("#templateError");
+      const templateParticipant = document.querySelector(
+        "#templateParticipant",
+      );
+
+      const elementSink = document.querySelector("#sink");
+      const elementParticipants = document.querySelector("#participants");
+      const elementLoader = document.querySelector("#loader");
+
+      let isDead = false;
+
+      function die(error) {
+        if (!isDead) {
+          renderError(document.body, error);
+        }
+        isDead = true;
+      }
+
+      window.onerror = (error) => {
+        die(error);
+      };
+      window.onunhandledrejection = (rejection) => {
+        die(rejection.reason);
+      };
+
+      let device;
+      let muteSelf = false;
+      let muteOthers = false;
+      let echoCancellation = true;
+      let noiseSuppression = true;
+
+      function isMuted(id) {
+        return id === NETWORK_ID ? muteSelf : muteOthers;
+      }
+
+      function onNameInput(event) {
+        NETWORK_PARTICIPANT.name = event.target.value;
+      }
+
+      function onMicSwitch(event) {
+        const isSelf = event.target.dataset.id === NETWORK_ID;
+        if (isSelf) {
+          muteSelf = !muteSelf;
+        } else {
+          muteOthers = !muteOthers;
+        }
+        refreshSwitch(event.target, !isMuted(event.target.dataset.id));
+        audioSetup();
+      }
+
+      function onMicEchoCancellation(event) {
+        echoCancellation = !echoCancellation;
+        refreshCheckbox(event.target, echoCancellation);
+        audioSetup();
+      }
+
+      function onMicNoiseSuppression(event) {
+        noiseSuppression = !noiseSuppression;
+        refreshCheckbox(event.target, noiseSuppression);
+        audioSetup();
+      }
+
+      async function onSelectOutputDevice(event) {
+        try {
+          device = await navigator.mediaDevices.selectAudioOutput();
+          await audioSetup();
+        } catch (error) {
+          if (error.name !== "NotAllowedError") {
+            throw error;
+          } else {
+            return;
+          }
+        }
+      }
+
+      let webSocket;
+      let webParticipants = new Map();
+
+      function addParticipant(participant) {
+        const old = webParticipants.get(participant.id) ?? {};
+        const update =
+          old.id !== participant.id || old.name !== participant.name;
+        participant.timestamp = Date.now();
+        webParticipants.set(participant.id, participant);
+        return update;
+      }
+
+      function removeUnresponsiveParticipants() {
+        let update = false;
+        const now = Date.now();
+        for (const [id, participant] of webParticipants.entries()) {
+          if (
+            id !== NETWORK_ID &&
+            now - participant.timestamp > NETWORK_LIFETIME
+          ) {
+            webParticipants.delete(id);
+            update = true;
+          }
+        }
+        return update;
+      }
+
+      function networkSetup() {
+        const url =
+          window.location.protocol === "file:"
+            ? "ws://127.0.0.1:3000"
+            : `wss://${window.location.host}${window.location.pathname}/websocket`;
+        console.log("network:connect", url);
+        webSocket = new WebSocket(url);
+        webSocket.binaryType = "arraybuffer";
+        webSocket.onopen = async () => {
+          console.log("network:open");
+          while (webSocket?.readyState === WebSocket.OPEN) {
+            webSocket.send(JSON.stringify(NETWORK_PARTICIPANT));
+            await sleep(NETWORK_PULSE);
+            if (removeUnresponsiveParticipants()) {
+              renderParticipants(elementParticipants);
+            }
+            refreshLoader(
+              elementLoader,
+              webSocket?.readyState === WebSocket.OPEN,
+            );
+          }
+        };
+        webSocket.onmessage = (event) => {
+          if (event.data instanceof ArrayBuffer) {
+            if (playerNode) {
+              playerNode.port.postMessage({
+                type: "data",
+                data: new Float32Array(event.data),
+              });
+            }
+          } else {
+            const participant = JSON.parse(event.data);
+            if (addParticipant(participant)) {
+              renderParticipants(elementParticipants);
+            }
+          }
+        };
+        webSocket.onerror = () => {
+          console.log("network:error");
+        };
+        webSocket.onclose = (event) => {
+          console.log("network:close", event.code, event.reason);
+          networkSetup();
+        };
+        if (addParticipant(NETWORK_PARTICIPANT)) {
+          renderParticipants(elementParticipants);
+        }
+      }
+
+      let audioMediaStream;
+      let audioContext;
+      let micNode;
+      let micSourceNode;
+      let playerDestinationNode;
+      let playerNode;
+
+      async function audioSetup() {
+        if (audioContext) {
+          await audioShutdown();
+        }
+        try {
+          audioMediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              autoGainControl: false,
+              echoCancellation,
+              noiseSuppression,
+            },
+          });
+        } catch (error) {
+          if (error.name !== "NotAllowedError") {
+            throw error;
+          } else {
+            return;
+          }
+        }
+        audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+        if (audioContext.sampleRate !== SAMPLE_RATE) {
+          throw new Error(
+            `Invalid sample rate: expected ${SAMPLE_RATE}, got ${audioContext.sampleRate}`,
+          );
+        }
+        await audioContext.audioWorklet.addModule("audio.js");
+        micNode = new AudioWorkletNode(audioContext, "encoder-processor");
+        micNode.port.onmessage = (event) => {
+          if (webSocket?.readyState === WebSocket.OPEN) {
+            webSocket.send(event.data);
+          }
+        };
+        micSourceNode = audioContext.createMediaStreamSource(audioMediaStream);
+        if (!muteSelf) {
+          micSourceNode.connect(micNode);
+        }
+        playerDestinationNode = audioContext.createMediaStreamDestination();
+        playerNode = new AudioWorkletNode(audioContext, "decoder-processor");
+        playerNode.port.postMessage({
+          type: "config",
+          sampleRate: SAMPLE_RATE,
+          sampleWindow: SAMPLE_WINDOW,
+        });
+        if (!muteOthers) {
+          playerNode.connect(playerDestinationNode);
+        }
+        elementSink.srcObject = playerDestinationNode.stream;
+        if (device !== undefined) {
+          await elementSink.setSinkId(device.deviceId);
+        }
+        elementSink.play();
+        await audioContext.resume();
+      }
+
+      async function audioShutdown() {
+        if (playerNode) {
+          playerNode.disconnect();
+          playerNode = undefined;
+        }
+        if (playerDestinationNode) {
+          playerDestinationNode.disconnect();
+          playerDestinationNode = undefined;
+        }
+        if (micSourceNode) {
+          micSourceNode.disconnect();
+          micSourceNode = undefined;
+        }
+        if (micNode) {
+          micNode.disconnect();
+          micNode = undefined;
+        }
+        if (audioContext) {
+          await audioContext.close();
+          audioContext = undefined;
+        }
+        if (audioMediaStream) {
+          for (const audioMediaStreamTrack of audioMediaStream.getTracks()) {
+            audioMediaStreamTrack.stop();
+          }
+          audioMediaStream = undefined;
+        }
+      }
+
+      function clear(container) {
+        while (container.lastChild) {
+          container.removeChild(container.lastChild);
+        }
+      }
+
+      function refreshLoader(element, isLoaded) {
+        if (isLoaded) {
+          element.classList.add("opaque");
+        } else {
+          element.classList.remove("opaque");
+        }
+      }
+
+      function refreshSwitch(element, isOn) {
+        if (isOn) {
+          element.classList.remove("mic-mute-fill");
+          element.classList.add("mic-fill");
+        } else {
+          element.classList.remove("mic-fill");
+          element.classList.add("mic-mute-fill");
+        }
+      }
+
+      function refreshCheckbox(element, isOn) {
+        if (isOn) {
+          element.classList.remove("off");
+        } else {
+          element.classList.add("off");
+        }
+      }
+
+      function renderError(elementContainer, error) {
+        clear(elementContainer);
+        const element = document.importNode(templateError.content, true);
+        const elementErrorDescription = element.querySelector("h3");
+        elementErrorDescription.textContent = error;
+        const elementErrorTrace = element.querySelector("pre");
+        elementErrorTrace.textContent = error.stack;
+        elementContainer.appendChild(element);
+      }
+
+      function renderParticipants(elementContainer) {
+        clear(elementContainer);
+        let index = 0;
+        for (const [id, participant] of webParticipants.entries()) {
+          const isSelf = id === NETWORK_ID;
+          const element = document.importNode(
+            templateParticipant.content,
+            true,
+          );
+          const elementParticipant = element.querySelector(".participant");
+          elementParticipant.style.backgroundColor =
+            COLORS[index % COLORS.length];
+          const elementName = element.querySelector(".participant-name");
+          elementName.disabled = !isSelf;
+          elementName.value = participant.name;
+          const elementMicSwitch = element.querySelector(".mic-switch");
+          elementMicSwitch.dataset.id = id;
+          refreshSwitch(elementMicSwitch, !isMuted(id));
+          const elementEchoCancellation = element.querySelector(
+            ".mic-echo-cancellation",
+          );
+          if (isSelf) {
+            refreshCheckbox(elementEchoCancellation, echoCancellation);
+          } else {
+            elementEchoCancellation.style.display = "none";
+          }
+          const elementNoiseSuppression = element.querySelector(
+            ".mic-noise-suppression",
+          );
+          if (isSelf) {
+            refreshCheckbox(elementNoiseSuppression, noiseSuppression);
+          } else {
+            elementNoiseSuppression.style.display = "none";
+          }
+          const elementOutputDevice = element.querySelector(".output-device");
+          if (!isSelf || !CAN_SELECT_OUTPUT_DEVICE) {
+            elementOutputDevice.style.display = "none";
+          }
+          elementContainer.appendChild(element);
+          index++;
+        }
+      }
+
+      function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      async function initialize() {
+        await networkSetup();
+        await audioSetup();
+      }
+
+      initialize();
+    </script>
+  </body>
+</html>
