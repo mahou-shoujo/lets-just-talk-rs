@@ -301,7 +301,7 @@
       function networkSetup() {
         const url =
           window.location.protocol === "file:"
-            ? "ws://127.0.0.1:3000"
+            ? "ws://127.0.0.1:8881"
             : `wss://${window.location.host}${window.location.pathname}/websocket`;
         console.log("network:connect", url);
         webSocket = new WebSocket(url);
@@ -335,11 +335,12 @@
             }
           }
         };
-        webSocket.onerror = () => {
+        webSocket.onerror = async () => {
           console.log("network:error");
         };
-        webSocket.onclose = (event) => {
+        webSocket.onclose = async (event) => {
           console.log("network:close", event.code, event.reason);
+          await sleep(NETWORK_PULSE);
           networkSetup();
         };
         if (addParticipant(NETWORK_PARTICIPANT)) {
