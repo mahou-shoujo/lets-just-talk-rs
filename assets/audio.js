@@ -3,24 +3,14 @@ class EncoderProcessor extends AudioWorkletProcessor {
     if (inputs.length > 0) {
       const inputChannels = inputs[0];
       if (inputChannels && inputChannels.length > 0) {
-        const audioFrame = new Float32Array(inputChannels[0]);
-        if (!isZero(audioFrame)) {
-          this.port.postMessage(audioFrame, { transfer: [audioFrame.buffer] });
-        }
+        const inputChannel = new Float32Array(inputChannels[0]);
+        this.port.postMessage(inputChannel, {
+          transfer: [inputChannel.buffer],
+        });
       }
     }
     return true;
   }
-}
-
-function isZero(array) {
-  for (let index = 0; index < array.length; index++) {
-    const element = array[index];
-    if (element !== 0.0) {
-      return false;
-    }
-  }
-  return true;
 }
 
 registerProcessor("encoder-processor", EncoderProcessor);
@@ -49,14 +39,14 @@ class DecoderProcessor extends AudioWorkletProcessor {
     if (outputs.length > 0) {
       const outputChannels = outputs[0];
       if (outputChannels && outputChannels.length > 0) {
-        const monoChannel = outputChannels[0];
+        const outputChannel = outputChannels[0];
         if (this.#ring) {
-          this.#ring.dequeue(monoChannel);
+          this.#ring.dequeue(outputChannel);
         } else {
-          monoChannel.fill(0);
+          outputChannel.fill(0);
         }
         for (let i = 1; i < outputChannels.length; i++) {
-          outputChannels[i].set(monoChannel);
+          outputChannels[i].set(outputChannel);
         }
       }
     }
