@@ -5,28 +5,39 @@ use futures_util::{
 };
 use log::{debug, error, info, warn};
 use std::{
+    collections::HashMap,
     error::Error,
+    fmt::{self, Display},
     net::{IpAddr, SocketAddr},
     panic,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
     select, signal,
-    sync::broadcast::{Receiver, Sender, channel, error::RecvError},
+    sync::{
+        RwLock,
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    },
     task::{JoinError, JoinSet},
     time::timeout,
 };
-use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::{
+        Message,
+        handshake::server::{Request, Response},
+        http::Uri,
+    },
+};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Parser)]
-struct Args {
+struct Arguments {
     /// The addr to listen to
     #[arg(short = 'd', long, default_value_t = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 8881))]
     addr: SocketAddr,
-    /// Buffer capacity
-    #[arg(short, long, default_value_t = 32768)]
-    capacity: usize,
     /// Handshake timeout in seconds
     #[arg(long, default_value_t = 10)]
     handshake_timeout: u64,
@@ -41,11 +52,11 @@ struct Args {
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
     let _ = simple_logger::init_with_env();
-    let args = Args::parse();
-    let listener = TcpListener::bind(args.addr).await?;
-    info!("listening on {addr}", addr = args.addr);
-    let (tx, _) = channel(args.capacity);
+    let arguments = Arguments::parse();
+    let state = State::default();
     let mut join_set = JoinSet::new();
+    let listener = TcpListener::bind(arguments.addr).await?;
+    info!("listening on {addr}", addr = arguments.addr);
     loop {
         select! {
             _ = interruption() => {
@@ -54,9 +65,15 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             accept_result = listener.accept() => {
                 clear_ready_tasks(&mut join_set);
                 match accept_result {
-                    Ok((tcp_stream, addr)) => {
-                        let accept_future = accept(args, tx.clone(), addr, tcp_stream);
-                        join_set.spawn(accept_future);
+                    Ok((tcp_stream, socket_addr)) => {
+                        let client = Client {
+                            arguments,
+                            state: state.clone(),
+                            client_id: ClientId { socket_addr, uuid: Uuid::new_v4() },
+                            room_id: RoomId { uri: None },
+                        };
+                        let fut = accept(client, tcp_stream);
+                        join_set.spawn(fut);
                     }
                     Err(error) => {
                         error!("accept error: {error}");
@@ -67,7 +84,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     }
     if !join_set.is_empty() {
         info!("waiting for {} tasks before shutdown", join_set.len());
-        let _ = tx.send(Broadcast::Interruption);
+        state.interrupt().await;
         clear_tasks(&mut join_set).await;
     }
     Ok(())
@@ -111,69 +128,71 @@ async fn interruption() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn accept(args: Args, tx: Sender<Broadcast>, addr: SocketAddr, tcp_stream: TcpStream) {
-    info!("new connection: {addr}");
-    if let Some(ws_stream) = handshake(args, addr, tcp_stream).await {
-        listen(args, addr, tx, ws_stream).await;
+async fn accept(mut client: Client, tcp_stream: TcpStream) {
+    info!("{client}: new connection");
+    if let Some(ws_stream) = handshake(&mut client, tcp_stream).await {
+        listen(&client, ws_stream).await;
     }
 }
 
 async fn handshake(
-    args: Args,
-    addr: SocketAddr,
+    client: &mut Client,
     tcp_stream: TcpStream,
 ) -> Option<WebSocketStream<TcpStream>> {
-    let handshake_result = timeout(
-        Duration::from_secs(args.handshake_timeout),
-        tokio_tungstenite::accept_async(tcp_stream),
-    )
-    .await;
+    let handshake_fut = tokio_tungstenite::accept_hdr_async(
+        tcp_stream,
+        #[expect(clippy::result_large_err)]
+        |req: &Request, res: Response| {
+            client.room_id.uri = Some(req.uri().clone());
+            Ok(res)
+        },
+    );
+    let handshake_fut_with_timeout = timeout(
+        Duration::from_secs(client.arguments.handshake_timeout),
+        handshake_fut,
+    );
+    let handshake_result = handshake_fut_with_timeout.await;
     match handshake_result {
         Ok(Ok(ws_stream)) => {
-            debug!("handshake success with {addr}");
+            debug!("{client}: handshake success");
             Some(ws_stream)
         }
         Ok(Err(error)) => {
-            error!("handshake error with {addr}: {error}");
+            error!("{client}: handshake error: {error}");
             None
         }
         Err(_) => {
-            warn!("handshake timeout with {addr}");
+            warn!("{client}: handshake timeout");
             None
         }
     }
 }
 
-async fn listen(
-    args: Args,
-    addr: SocketAddr,
-    mut tx: Sender<Broadcast>,
-    ws_stream: WebSocketStream<TcpStream>,
-) {
-    let mut rx = tx.subscribe();
+async fn listen(client: &Client, ws_stream: WebSocketStream<TcpStream>) {
     let (mut ws_sink, mut ws_source) = ws_stream.split();
+    let (tx, mut rx) = unbounded_channel();
+    client.register(tx).await;
     loop {
         let must_abort = select! {
-            must_abort = broadcast(args,addr, &mut tx, &mut ws_source) => must_abort,
-            must_abort = relay(args, addr, &mut rx, &mut ws_sink) => must_abort,
+            must_abort = broadcast(client, &mut ws_source) => must_abort,
+            must_abort = relay(client, &mut rx, &mut ws_sink) => must_abort,
         };
         if must_abort {
             break;
         }
     }
+    client.unregister().await;
 }
 
 async fn broadcast(
-    args: Args,
-    addr: SocketAddr,
-    tx: &mut Sender<Broadcast>,
+    client: &Client,
     ws_source: &mut SplitStream<WebSocketStream<TcpStream>>,
 ) -> bool {
-    let maybe_message = recv(args, addr, ws_source).await;
+    let maybe_message = recv(client, ws_source).await;
     match maybe_message {
         Some(message) if matches!(&message, Message::Close(_)) => false,
         Some(message) => {
-            let _ = tx.send(Broadcast::Echo { addr, message });
+            client.broadcast(message).await;
             false
         }
         None => true,
@@ -181,27 +200,30 @@ async fn broadcast(
 }
 
 async fn recv(
-    args: Args,
-    addr: SocketAddr,
+    client: &Client,
     ws_source: &mut SplitStream<WebSocketStream<TcpStream>>,
 ) -> Option<Message> {
     loop {
-        let recv_result = timeout(Duration::from_secs(args.idle_timeout), ws_source.next()).await;
+        let recv_result = timeout(
+            Duration::from_secs(client.arguments.idle_timeout),
+            ws_source.next(),
+        )
+        .await;
         break match recv_result {
             Ok(Some(Ok(message))) if matches!(&message, Message::Close(_)) => {
                 continue;
             }
             Ok(Some(Ok(message))) => Some(message),
             Ok(Some(Err(error))) => {
-                error!("recv error with {addr}: {error}");
+                error!("{client}: recv error with: {error}");
                 continue;
             }
             Ok(None) => {
-                info!("closed {addr}");
+                info!("{client}: closed");
                 None
             }
             Err(_) => {
-                warn!("idle timeout with {addr}");
+                warn!("{client}: idle timeout");
                 None
             }
         };
@@ -209,55 +231,182 @@ async fn recv(
 }
 
 async fn relay(
-    args: Args,
-    addr: SocketAddr,
-    rx: &mut Receiver<Broadcast>,
+    client: &Client,
+    rx: &mut UnboundedReceiver<Broadcast>,
     ws_sink: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
 ) -> bool {
-    let broadcast_result = rx.recv().await;
-    match broadcast_result {
-        Ok(Broadcast::Echo {
-            addr: broadcast_addr,
-            message,
-        }) => {
-            if addr != broadcast_addr {
-                send(args, addr, message, ws_sink).await;
-            }
+    let maybe_broadcast = rx.recv().await;
+    match maybe_broadcast {
+        Some(Broadcast::Message(message)) => {
+            send(client, ws_sink, message).await;
             false
         }
-        Ok(Broadcast::Interruption) => {
-            send(args, addr, Message::Close(None), ws_sink).await;
+        Some(Broadcast::Interruption) => {
+            send(client, ws_sink, Message::Close(None)).await;
             true
         }
-        Err(RecvError::Lagged(_)) => false,
-        Err(RecvError::Closed) => true,
+        None => true,
     }
 }
 
 async fn send(
-    args: Args,
-    addr: SocketAddr,
-    message: Message,
+    client: &Client,
     ws_sink: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
+    message: Message,
 ) {
     let send_result = timeout(
-        Duration::from_secs(args.send_timeout),
+        Duration::from_secs(client.arguments.send_timeout),
         ws_sink.send(message),
     )
     .await;
     match send_result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            error!("send error with {addr}: {error}");
+            error!("{client}: send error: {error}");
         }
         Err(_) => {
-            warn!("send timeout with {addr}");
+            warn!("{client}: send timeout");
         }
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct State {
+    rooms: Arc<RwLock<HashMap<RoomId, Room>>>,
+}
+
+impl State {
+    async fn interrupt(&self) {
+        let rooms = self.rooms.read().await;
+        for room in rooms.values() {
+            for client_target in room.clients.values() {
+                let _ = client_target.tx.send(Broadcast::Interruption);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Client {
+    arguments: Arguments,
+    state: State,
+    client_id: ClientId,
+    room_id: RoomId,
+}
+
+impl Display for Client {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{client_id} ({room_id})",
+            client_id = &self.client_id,
+            room_id = &self.room_id,
+        )
+    }
+}
+
+impl Client {
+    async fn register(&self, tx: UnboundedSender<Broadcast>) {
+        let mut rooms = self.state.rooms.write().await;
+        let room = rooms
+            .entry(self.room_id.clone())
+            .or_insert_with_key(|room_id| {
+                info!("new room {room_id}");
+                Room::default()
+            });
+        info!(
+            "new client {client_id} in room {room_id}",
+            client_id = &self.client_id,
+            room_id = &self.room_id,
+        );
+        if room
+            .clients
+            .insert(self.client_id.clone(), ClientTarget { tx })
+            .is_some()
+        {
+            warn!("{self}: collision");
+        }
+    }
+
+    async fn unregister(&self) {
+        let mut rooms = self.state.rooms.write().await;
+        match rooms.get_mut(&self.room_id) {
+            Some(room) => {
+                if room.clients.remove(&self.client_id).is_some() {
+                    info!(
+                        "removed client {client_id} in room {room_id}",
+                        client_id = &self.client_id,
+                        room_id = &self.room_id,
+                    );
+                } else {
+                    warn!("{self}: can't unregister: invalid client id");
+                }
+                if room.clients.is_empty() {
+                    rooms.remove(&self.room_id);
+                    info!("removed room {room_id}", room_id = &self.room_id);
+                }
+            }
+            None => {
+                warn!("{self}: can't unregister: invalid room id");
+            }
+        }
+    }
+
+    async fn broadcast(&self, message: Message) {
+        let rooms = self.state.rooms.read().await;
+        if let Some(room) = rooms.get(&self.room_id) {
+            for (client_id, client_target) in &room.clients {
+                if client_id != &self.client_id {
+                    let _ = client_target.tx.send(Broadcast::Message(message.clone()));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClientId {
+    socket_addr: SocketAddr,
+    uuid: Uuid,
+}
+
+impl Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{socket_addr}|{uuid}",
+            socket_addr = self.socket_addr,
+            uuid = self.uuid,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RoomId {
+    uri: Option<Uri>,
+}
+
+impl Display for RoomId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match &self.uri {
+            Some(uri) => write!(f, "{uri}"),
+            None => write!(f, "<unknown room>"),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Room {
+    clients: HashMap<ClientId, ClientTarget>,
+}
+
+#[derive(Debug)]
+struct ClientTarget {
+    tx: UnboundedSender<Broadcast>,
+}
+
 #[derive(Debug, Clone)]
 enum Broadcast {
-    Echo { addr: SocketAddr, message: Message },
+    Message(Message),
     Interruption,
 }
