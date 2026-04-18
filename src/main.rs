@@ -1,11 +1,12 @@
 use clap::Parser;
 use futures_util::{
     SinkExt, StreamExt,
-    stream::{SplitSink, SplitStream},
+    future::select,
+    stream::{SplitSink, SplitStream, iter},
 };
 use log::{debug, error, info, warn};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     error::Error,
     fmt::{self, Display},
     net::{IpAddr, SocketAddr},
@@ -47,6 +48,9 @@ struct Arguments {
     /// Idle timeout in seconds
     #[arg(long, default_value_t = 30)]
     idle_timeout: u64,
+    /// Buffer size in bytes per client
+    #[arg(long, default_value_t = 96000)]
+    buffer_size: u64,
 }
 
 #[tokio::main]
@@ -171,31 +175,19 @@ async fn handshake(
 async fn listen(client: &Client, ws_stream: WebSocketStream<TcpStream>) {
     let (mut ws_sink, mut ws_source) = ws_stream.split();
     let (tx, mut rx) = unbounded_channel();
+    let mut queue = VecDeque::new();
     client.register(tx).await;
-    loop {
-        let must_abort = select! {
-            must_abort = broadcast(client, &mut ws_source) => must_abort,
-            must_abort = relay(client, &mut rx, &mut ws_sink) => must_abort,
-        };
-        if must_abort {
-            break;
-        }
-    }
+    select(
+        Box::pin(broadcast(client, &mut ws_source)),
+        Box::pin(relay(client, &mut rx, &mut queue, &mut ws_sink)),
+    )
+    .await;
     client.unregister().await;
 }
 
-async fn broadcast(
-    client: &Client,
-    ws_source: &mut SplitStream<WebSocketStream<TcpStream>>,
-) -> bool {
-    let maybe_message = recv(client, ws_source).await;
-    match maybe_message {
-        Some(message) if matches!(&message, Message::Close(_)) => false,
-        Some(message) => {
-            client.broadcast(message).await;
-            false
-        }
-        None => true,
+async fn broadcast(client: &Client, ws_source: &mut SplitStream<WebSocketStream<TcpStream>>) {
+    while let Some(message) = recv(client, ws_source).await {
+        client.broadcast(message).await;
     }
 }
 
@@ -233,30 +225,48 @@ async fn recv(
 async fn relay(
     client: &Client,
     rx: &mut UnboundedReceiver<Broadcast>,
+    queue: &mut VecDeque<Message>,
     ws_sink: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
-) -> bool {
-    let maybe_broadcast = rx.recv().await;
-    match maybe_broadcast {
-        Some(Broadcast::Message(message)) => {
-            send(client, ws_sink, message).await;
-            false
+) {
+    while let Some(mut broadcast) = rx.recv().await {
+        let mut seen_bytes = 0;
+        let mut dropped_bytes = 0;
+        loop {
+            let Broadcast::Message(message) = broadcast else {
+                info!("{client}: received interrupt");
+                queue.push_back(Message::Close(None));
+                break;
+            };
+            seen_bytes += message.len();
+            if seen_bytes > client.arguments.buffer_size as usize
+                && let Some(dropped) = queue.pop_front()
+            {
+                let bytes = dropped.len();
+                dropped_bytes += bytes;
+                seen_bytes -= bytes;
+            }
+            queue.push_back(message);
+            let Ok(next) = rx.try_recv() else {
+                break;
+            };
+            broadcast = next;
         }
-        Some(Broadcast::Interruption) => {
-            send(client, ws_sink, Message::Close(None)).await;
-            true
+        if dropped_bytes > 0 {
+            warn!("{client}: dropping {dropped_bytes} bytes to free the queue");
         }
-        None => true,
+        send(client, queue, ws_sink).await;
     }
 }
 
 async fn send(
     client: &Client,
+    queue: &mut VecDeque<Message>,
     ws_sink: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
-    message: Message,
 ) {
+    let mut drain = iter(queue.drain(..).map(Ok));
     let send_result = timeout(
         Duration::from_secs(client.arguments.send_timeout),
-        ws_sink.send(message),
+        ws_sink.send_all(&mut drain),
     )
     .await;
     match send_result {
@@ -353,11 +363,13 @@ impl Client {
     }
 
     async fn broadcast(&self, message: Message) {
-        let rooms = self.state.rooms.read().await;
-        if let Some(room) = rooms.get(&self.room_id) {
-            for (client_id, client_target) in &room.clients {
-                if client_id != &self.client_id {
-                    let _ = client_target.tx.send(Broadcast::Message(message.clone()));
+        if !matches!(&message, Message::Close(_)) {
+            let rooms = self.state.rooms.read().await;
+            if let Some(room) = rooms.get(&self.room_id) {
+                for (client_id, client_target) in &room.clients {
+                    if client_id != &self.client_id {
+                        let _ = client_target.tx.send(Broadcast::Message(message.clone()));
+                    }
                 }
             }
         }
