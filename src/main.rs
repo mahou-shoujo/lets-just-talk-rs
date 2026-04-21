@@ -49,7 +49,7 @@ struct Arguments {
     #[arg(long, default_value_t = 30)]
     idle_timeout: u64,
     /// Buffer size in bytes per client
-    #[arg(long, default_value_t = 96000)]
+    #[arg(long, default_value_t = 57600)]
     buffer_size: u64,
 }
 
