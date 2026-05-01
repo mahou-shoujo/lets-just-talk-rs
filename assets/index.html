@@ -78,6 +78,31 @@
         padding: 1ch;
       }
 
+      .vibrating {
+        animation: vibrate 0.3s linear 0s infinite normal both;
+      }
+
+      @keyframes vibrate {
+        0% {
+          transform: translate(0);
+        }
+        20% {
+          transform: translate(-2px, 2px);
+        }
+        40% {
+          transform: translate(-2px, -2px);
+        }
+        60% {
+          transform: translate(2px, 2px);
+        }
+        80% {
+          transform: translate(2px, -2px);
+        }
+        100% {
+          transform: translate(0);
+        }
+      }
+
       .name {
         width: 40ch;
         border-radius: 1ch;
@@ -172,6 +197,7 @@
           ? "ws://127.0.0.1:8881"
           : `wss://${window.location.host}${window.location.pathname}${window.location.pathname.endsWith("/") ? "" : "/"}websocket`;
 
+      const AUDIO_ACTIVE_THRESHOLD = 0.025;
       const AUDIO_SAMPLE_RATE = 48000;
       const AUDIO_SAMPLE_WINDOW = 0.3;
 
@@ -283,6 +309,20 @@
           }
         }
 
+        updateParticipantFeedback(participant) {
+          for (const elParticipant of this.#elParticipants.children) {
+            if (elParticipant.participantId === participant.id()) {
+              if (!elParticipant.classList.contains("vibrating")) {
+                elParticipant.classList.add("vibrating");
+              }
+              clearTimeout(elParticipant.participantTimer);
+              elParticipant.participantTimer = setTimeout(() => {
+                elParticipant.classList.remove("vibrating");
+              }, 300);
+            }
+          }
+        }
+
         updateParticipants() {
           UI.#removeAllChildren(this.#elParticipants);
           let index = 0;
@@ -310,6 +350,7 @@
         #updateCard(participant, index, el) {
           const color = COLORS[index % COLORS.length];
           el.style.background = `radial-gradient(circle, ${color}, color-mix(in srgb, ${color}, black 35%)`;
+          el.participantId = participant.id();
         }
 
         #updateNameControl(participant, el) {
@@ -578,6 +619,12 @@
           const { id, data } = deserializePacket(buffer);
           const participant = participants.get(id);
           if (participant && !participant.isSuppressed()) {
+            const isActive = data.find(
+              (n) => Math.abs(n) > AUDIO_ACTIVE_THRESHOLD,
+            );
+            if (isActive) {
+              ui.updateParticipantFeedback(participant);
+            }
             audioDestinationDecoderNode.port.postMessage({
               type: "data",
               data,
