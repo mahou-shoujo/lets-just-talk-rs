@@ -556,6 +556,18 @@
       let audioSinkDevice;
       let audioSink = document.querySelector("audio");
 
+      async function audioPlay(src) {
+        try {
+          const sound = new Audio(src);
+          await sound.play();
+        } catch (error) {
+          if (error.name === "NotAllowedError") {
+            return;
+          }
+          throw error;
+        }
+      }
+
       async function audioSetSink(maybeAudioSinkDevice) {
         audioSinkDevice = maybeAudioSinkDevice;
         await audioSetup();
@@ -703,6 +715,9 @@
           return isUpdated ? old : undefined;
         } else {
           console.log("participant:add", id, name);
+          if (!isMe) {
+            audioPlay("audio/on.mp3");
+          }
           const participant = new Participant(
             isMe,
             isMuted,
@@ -728,6 +743,9 @@
             participants.delete(participant.id());
             isUpdated = true;
           }
+        }
+        if (isUpdated) {
+          audioPlay("audio/off.mp3");
         }
         return isUpdated;
       }
