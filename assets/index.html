@@ -423,13 +423,14 @@
         die(rejection.reason);
       };
 
-      const HEADER_LENGTH = 36;
+      const HEADER_LENGTH = 16;
 
       function serializeId(buffer, id) {
-        const textEncoder = new TextEncoder();
-        const bytes = textEncoder.encode(id);
-        const bytesView = new Uint8Array(buffer, 0, HEADER_LENGTH);
-        bytesView.set(bytes);
+        const hex = id.replace(/-/g, "");
+        const bytes = new Uint8Array(buffer, 0, HEADER_LENGTH);
+        for (let i = 0; i < HEADER_LENGTH; i++) {
+          bytes[i] = parseInt(hex.substr(i * 2, 2), HEADER_LENGTH);
+        }
       }
 
       function serializeData(buffer, data) {
@@ -447,8 +448,17 @@
       }
 
       function deserializeId(buffer) {
-        const textDecoder = new TextDecoder();
-        return textDecoder.decode(new Uint8Array(buffer, 0, HEADER_LENGTH));
+        const bytes = new Uint8Array(buffer, 0, HEADER_LENGTH);
+        const hex = Array.from(bytes)
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
+        return [
+          hex.slice(0, 8),
+          hex.slice(8, 12),
+          hex.slice(12, 16),
+          hex.slice(16, 20),
+          hex.slice(20),
+        ].join("-");
       }
 
       function deserializeData(buffer) {
@@ -692,6 +702,7 @@
           old.rename(name);
           return isUpdated ? old : undefined;
         } else {
+          console.log("participant:add", id, name);
           const participant = new Participant(
             isMe,
             isMuted,
@@ -709,6 +720,11 @@
         const now = Date.now();
         for (const participant of callee()) {
           if (now - participant.timestamp() > NETWORK_TTL) {
+            console.log(
+              "participant:remove",
+              participant.id(),
+              participant.name(),
+            );
             participants.delete(participant.id());
             isUpdated = true;
           }
